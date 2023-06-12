@@ -1,0 +1,254 @@
+stages:
+  - stage-build
+  - stage-analyze
+  - stage-test
+  - stage-deploy
+  - prod-build
+  - prod-deploy
+
+#services:
+#  - postgres:14.7-alpine
+
+variables:
+  CONTAINER_IMAGE_PATH: $CI_REGISTRY/$CI_PROJECT_PATH:$CI_COMMIT_SHORT_SHA #see https://docs.gitlab.com/ee/ci/variables/predefined_variables.html
+  POSTGRES_DB: eis_server_db
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: db_password
+  POSTGRES_HOST_AUTH_METHOD: trust
+  DB_HOST: postgres_eis_server
+  DB_NAME: eis_server_db
+  DB_USER: postgres
+  DB_PASSWORD: db_password
+  DB_PORT: 5432
+
+before_script:
+  # docker login asks for the password to be passed through stdin for security
+  # we use $CI_REGISTRY_PASSWORD here which is a special variable provided by GitLab
+  # https://docs.gitlab.com/ce/ci/variables/predefined_variables.html
+  #  - sudo docker version/
+  - echo -n $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+
+
+build-test:
+  stage: stage-build
+  environment: test
+  image: docker:20.10
+  only:
+    - staging
+    - main
+  services:
+    - docker:20.10-dind
+  script:
+    - docker pull $CI_REGISTRY_IMAGE:latest || true
+    - docker build
+      --pull
+      -f ./docker/php-fpm/Dockerfile
+      --build-arg BUILD_MODE=dev
+      --cache-from $CI_REGISTRY_IMAGE:latest
+      --label "org.opencontainers.image.title=$CI_PROJECT_TITLE"
+      --label "org.opencontainers.image.url=$CI_PROJECT_URL"
+      --label "org.opencontainers.image.created=$CI_JOB_STARTED_AT"
+      --label "org.opencontainers.image.revision=$CI_COMMIT_SHA"
+      --label "org.opencontainers.image.version=$CI_COMMIT_REF_NAME"
+      --tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+      .
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+  tags:
+    - git-magnum-lv
+
+#Push-latest:
+#  variables:
+#    GIT_STRATEGY: none
+#  stage: stage-build
+#  only:
+#    - main
+#
+#  script:
+#    - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+#    - docker tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA $CI_REGISTRY_IMAGE:latest
+#    - docker push $CI_REGISTRY_IMAGE:latest
+#  tags:
+#    - git-magnum-lv
+
+
+#test:
+#  stage: stage-analyze
+#  image: docker:20.10
+#  environment: test
+#  services:
+#    - docker:20.10-dind
+#  script:
+##    - docker login -u $CI_REGISTRY_USER -p $CI_JOB_TOKEN $CI_REGISTRY
+##    - docker pull --rm $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA /bin/bash -c "vendor/bin/phpunit"
+#    - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+#    - docker run --rm $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA /bin/bash -c "vendor/bin/phpunit"
+#  tags:
+#    - docker-git-magnum-lv
+#  after_script:
+#    - if [ $CI_JOB_STATUS == "failed" ]; then ./cleanup_image.sh; fi
+
+
+cs fixer:
+  stage: stage-analyze
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - docker run --rm $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA /bin/bash -c "php ./vendor/bin/php-cs-fixer fix --dry-run --diff"
+  tags:
+    - docker-git-magnum-lv
+
+deptrac:
+  stage: stage-analyze
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - docker run --rm $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA /bin/bash -c "vendor/bin/deptrac analyze"
+  tags:
+    - docker-git-magnum-lv
+
+#phpstan:
+#  stage: stage-analyze
+#  variables:
+#    GIT_STRATEGY: none
+#  script:
+#    - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+#    - docker run --rm $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA /bin/bash -c "vendor/bin/phpstan analyse -c phpstan.neon"
+#  tags:
+#    - docker-git-magnum-lv
+
+composer-validate:
+  stage: stage-analyze
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - docker run --rm $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA /bin/bash -c "composer validate --no-check-all --strict"
+  tags:
+    - docker-git-magnum-lv
+
+schema-validate:
+  needs:
+    - composer-validate
+  stage: stage-analyze
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - docker network create client-server || true
+    - docker run --rm --network client-server --name postgres_eis_server -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=db_password -p 5432:5432 -d postgres || true
+    - docker ps
+    - docker network ls
+    - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - docker run --rm --network client-server --name eis-head-$CI_COMMIT_SHA -d $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - docker exec eis-head-$CI_COMMIT_SHA /bin/bash -c "php bin/console doctrine:database:drop --force" || true
+    - docker exec eis-head-$CI_COMMIT_SHA /bin/bash -c "php bin/console doctrine:database:create"
+    - docker exec eis-head-$CI_COMMIT_SHA /bin/bash -c "php bin/console doctrine:schema:create"
+    - docker exec eis-head-$CI_COMMIT_SHA /bin/bash -c "php bin/console doctrine:schema:validate"
+  tags:
+    - docker-git-magnum-lv
+
+
+phpunit:
+  stage: stage-test
+  environment: test
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - docker run --rm --network client-server $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA /bin/bash -c "php bin/phpunit"
+  tags:
+    - docker-git-magnum-lv
+
+
+deploy-staging:
+  stage: stage-deploy
+  environment: staging
+  only:
+    - staging
+    - main
+  before_script:
+    - 'command -v ssh-agent >/dev/null || ( apt-get update -y && apt-get install openssh-client -y )'
+    - eval $(ssh-agent -s)
+    - ssh-add <(echo "$STAGE_SSH_PRIVATE_KEY" | base64 -d)
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+
+  script:
+    - ssh -o StrictHostKeyChecking=no $STAGE_SERVER_USERNAME@$STAGE_SERVER_HOST bin/bash "echo '$STAGE_ENVS' > /var/www/symfony/.env.local" || true
+    - docker run --rm --network client-server --name postgres_eis_server -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=db_password -p 5432:5432 -d postgres || true
+    - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - docker stop symfony || true
+    - docker rm -v symfony || true
+    - docker run --name symfony -p 80:8080 --network client-server -d --restart always $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - docker exec symfony /bin/bash -c "php bin/console doctrine:database:drop --force" || true
+    - docker exec symfony /bin/bash -c "php bin/console doctrine:database:create"
+    - docker exec symfony /bin/bash -c "php bin/console doctrine:schema:create"
+    - docker exec symfony /bin/bash -c "php bin/console doctrine:fixtures:load"
+
+  tags:
+    - docker-stage-eis-magnum-lv
+    #    - docker run --env-file /var/www/symfony/.env.local --name symfony -d --restart always $CONTAINER_IMAGE_PATH
+
+
+build-prod:
+  stage: prod-build
+  environment: production
+  image: docker:20.10
+  only:
+    - main
+  services:
+    - docker:20.10-dind
+  script:
+    - docker pull $CI_REGISTRY_IMAGE:latest || true
+    - docker build
+      --pull
+      -f ./docker/php-fpm/Dockerfile
+      --build-arg BUILD_MODE=production
+      --cache-from $CI_REGISTRY_IMAGE:latest
+      --label "org.opencontainers.image.title=$CI_PROJECT_TITLE"
+      --label "org.opencontainers.image.url=$CI_PROJECT_URL"
+      --label "org.opencontainers.image.created=$CI_JOB_STARTED_AT"
+      --label "org.opencontainers.image.revision=$CI_COMMIT_SHA"
+      --label "org.opencontainers.image.version=$CI_COMMIT_REF_NAME"
+      --tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+      .
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+  tags:
+    - git-magnum-lv
+
+
+Push latest:
+  variables:
+    GIT_STRATEGY: none
+  stage: prod-build
+  only:
+    - main
+
+  script:
+    - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - docker tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA $CI_REGISTRY_IMAGE:latest
+    - docker push $CI_REGISTRY_IMAGE:latest
+  tags:
+    - git-magnum-lv
+
+
+deploy-prod:
+  stage: prod-deploy
+  image: ictu/sshpass
+  environment: production
+  only:
+    - main
+  when: manual
+  before_script:
+    - export SSHPASS=$SERVER_PASSWORD
+    - 'command -v ssh-agent >/dev/null || ( apt-get update -y && apt-get install openssh-client -y )'
+    - eval $(ssh-agent -s)
+    - ssh-add <(echo "$STAGE_SSH_PRIVATE_KEY" | base64 -d)
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+  script:
+    - ssh -o StrictHostKeyChecking=no -p$SERVER_PORT $SERVER_USERNAME@$SERVER_HOST "echo -n $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY"
+    - ssh -o StrictHostKeyChecking=no -p$SERVER_PORT $SERVER_USERNAME@$SERVER_HOST "kubectl set image deployment/test-dep k8sphp=$CI_REGISTRY_IMAGE:latest && kubectl rollout status deployment/test-dep"
+  tags:
+    - eis-magnum-lv
